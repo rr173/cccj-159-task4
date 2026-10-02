@@ -76,10 +76,17 @@ open http://localhost:8080
 # Runner 验证执行租约操作页（待领/持有者/剩余时间/接管/审计）
 open http://localhost:8080/ops
 
+# 启动独立的设计签名封装服务（默认 8090，SQLite + 内容寻址 blob 落盘）
+python3 -m app.envelope_api --db data/envelope.db --port 8090
+# 浏览器打开信封谱系/签名状态/校验结果页
+open http://localhost:8090/envelopes
+# CLI 端到端演示（临时目录内创建、双签、封口、发布、导出并离线验真）
+python3 -m app.envelope_cli --db data/envelope.db demo
+
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（73 个：领域单测 + 租约协调不变量 + 真实 HTTP 端到端，含临时代理签核不变量）
+# 全部测试（84 个：原 ECO/租约/API 73 个 + 签名封装 11 个）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -91,6 +98,11 @@ app/
   service.py  领域核心：冻结指纹、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
   leases.py   验证执行租约协调：幂等领取(原子单赢家)、续租、代次+HMAC凭据完成、超时接管、重启恢复
   runner.py   模拟验证 Runner（自行算指纹；可演示迟到/篡改）
+  envelope_store.py 签名封装 SQLite schema、内容寻址 blob 与崩溃恢复元数据
+  envelope.py       发布信封：分块上传、内容哈希、Merkle 包含证明、Ed25519 多方签名、离线验真、原子发布
+  ed25519.py        零第三方依赖的 RFC 8032 Ed25519 签名/验签
+  envelope_cli.py   封装、上传、签名、发布、验真、导出 CLI
+  envelope_api.py   stdlib HTTP REST + `/envelopes` 页面
   api.py      stdlib HTTP REST 路由（ECO + 租约两组 API）
   demo.py     四场景端到端演示
 web/
@@ -98,11 +110,15 @@ web/
   app.js      零依赖 JS；浏览器端用 WebCrypto 复算 Runner 指纹
   ops.html    Runner 租约操作页（待领任务、持有者与剩余时间、超时接管、接管历史、拒绝审计）
   ops.js      租约领取/续租/完成/释放/接管；token 仅领取时分发，localStorage 保存授权
+  envelopes.html 设计签名发布信封页面（谱系、签名状态、校验结果、审计）
+  envelopes.js   零依赖 JS；支持浏览器 Ed25519 签名与信封/发布查询
 tests/
   test_service.py     24 个领域不变量测试
   test_delegation.py  18 个临时代理签核测试
   test_leases.py      22 个租约协调不变量测试（并发单赢家/幂等/代次凭据/接管/重跑迟到/重启恢复）
   test_api.py          9 个真实 socket HTTP 测试（含租约领取-接管-完成端到端）
+  test_envelope.py       9 个发布信封领域不变量（并发同内容、续传、撤权、签名者/根密钥轮换、篡改、恢复/同名冲突）
+  test_envelope_api.py   2 个真实 HTTP 端到端测试（双签发布离线验真、分块续传页面）
 ```
 
 ## ECO 状态机
@@ -155,6 +171,31 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
   （差异包 `verification/signoffs.json` 同步包含）；ECO 重新冻结（rebase/合并/新基线发布）
   仍将旧签核标记失效（`voided_at`），新纪元必须重签。
 - 工作台展示每角色**当前可签人员、代理来源与有效期**，并在 ECO 卡片提供"代理签核"按钮。
+
+## 独立设计签名封装服务
+
+`envelope_api.py` 提供与 ECO 服务隔离的发布信封服务，用于把待发布变更的
+**网表、约束、模块清单、签核记录**组装成内容寻址信封。
+
+- **内容寻址**：规范化 JSON（键排序、无空白、UTF-8）后计算内容 SHA-256；
+  `envelope_id == content_hash`。并发封装相同内容只落一个有效信封，多个会话指向同一 ID。
+- **分块上传与续传**：元数据、上传状态、分块索引和每块 SHA-256 全部 SQLite 落盘；
+  blob 按哈希内容寻址。重复块幂等，同序号不同内容返回 `CHUNK_CONFLICT`，
+  查询上传可返回 `missing_indexes`，进程重启后继续补齐并完成。
+- **多方签名、撤权历史与密钥轮换**：签名者公钥由服务根密钥签发注册表事件；
+  `REGISTER/REVOKE` 均带时间。签名者轮换会撤销旧 KID，根轮换由新旧根交叉签名同一事件，
+  离线方可沿根链追溯历史。验真按 `signed_at` 判断当时授权状态，因此撤权/轮换后
+  **历史签名仍有效，新签名被拒绝**；签名记录中的 signer/role 若被篡改也会拒绝。
+- **离线验真**：导出 ZIP 包含 `MANIFEST.json / SIGNATURES.json / TRUST.json /
+  PROOFS.json / artifacts/*`。离线校验重算构件、分块、内容哈希、Merkle root、
+  根签名注册表与每条签名，无需访问服务。
+- **原子发布**：先事务性写 `PUBLISHING` 发布名，再生成发布收据并原子 rename；
+  启动 `recover()` 幂等完成中断发布。同名不同内容以 `NAME_CONTENT_CONFLICT` 拒绝
+  并写审计；同名同内容幂等。
+- **篡改留痕**：内容、摘要、分块、签名或签名者注册表不一致时验真返回具体原因，
+  并写 `envelope_audit(result=REJECTED/INVALID)`。
+- **页面/CLI/REST**：页面 `/envelopes`；CLI `python3 -m app.envelope_cli --help`；
+  API 前缀 `/api/envelope`。
 
 ## 差异包
 

@@ -148,6 +148,56 @@ POST .../complete       → {gen:1, lease_token, fingerprint, verdict}
 | POST | `/api/constraints` | `{delta:{...}, by, note}` 存在 RELEASING 单时 409；否则在验 FROZEN 单全部转 REBASE_REQUIRED |
 | POST | `/api/admin/reset` | 重置为种子数据 |
 
+## 独立设计签名封装 API
+
+基础路径同主机，默认端口 `8090`，页面 `GET /envelopes`，API 前缀 `/api/envelope`。
+
+### 密钥与签名者
+
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| POST | `/api/envelope/keys/generate | `{}` → 一次性返回 `{kid, public_key, private_seed}` |
+| POST | `/api/envelope/signers` | `{kid, signer, role, public_key, replaces_kid?}`；轮换会同时写旧 key 的 `REVOKE` 注册表事件 |
+| POST | `/api/envelope/signers/{kid}/revoke` | `{reason?, by?}`；撤权后历史签名按 `signed_at` 验真，新签名拒绝 |
+| GET | `/api/envelope/signers` | 当前每个 kid 最新注册表事件 |
+| GET | `/api/envelope/root` | 注册表根公钥 |
+| POST | `/api/envelope/root/rotate` | `{by?}`；新旧根交叉签名 ROTATE 事件，旧根历史可沿根链离线追溯 |
+
+### 会话、构件与分块续传
+
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| POST | `/api/envelope/sessions` | `{by, required_roles?, parent_envelope_id?, metadata?, session_id?}` |
+| GET | `/api/envelope/sessions` / `.../sessions/{id}` | 会话、构件、上传、签名状态 |
+| POST | `/api/envelope/sessions/{id}/artifacts` | `{slot, kind, content, detail?}`；kind 为 `netlist/constraints/modules/signoffs` |
+| POST | `/api/envelope/sessions/{id}/uploads` | `{slot,kind,chunk_size,total_size}` 初始化分块上传 |
+| POST | `/api/envelope/uploads/{id}/chunks/{index}` | 原始 body；可用 `X-Chunk-Hash` 声明 SHA-256。重复块幂等，同序号不同内容 409 |
+| POST | `/api/envelope/uploads/{id}/chunks` | JSON：`{index,data_hex,chunk_hash?}`，便于小文件/测试 |
+| GET | `/api/envelope/sessions/{sid}/uploads/{id}` | 返回已收块、`missing_indexes`、`received_size`，用于断点续传 |
+| POST | `/api/envelope/uploads/{id}/complete` | 校验所有块并拼接为内容寻址 blob，再挂到构件槽位 |
+| POST | `/api/envelope/sessions/{id}/prepare` | 计算 `content_hash/envelope_id`、分块叶哈希和 Merkle root；同内容并发只生成一个信封 |
+
+### 签名、封口、发布与验真
+
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| GET | `/api/envelope/sessions/{id}/challenge/{kid}` | 获取固定签名挑战 `{schema,envelope_id,kid,signed_at}` |
+| POST | `/api/envelope/sessions/{id}/signatures` | `{signed_payload:challenge, signature}`；服务端验签时并入 content/merkle 上下文 |
+| POST | `/api/envelope/sessions/{id}/seal` | 校验全部必需角色、至少两个自然人、签名和内容哈希 |
+| POST | `/api/envelope/sessions/{id}/publish` | `{name,by}`；先写 PUBLISHING，再原子落发布收据，同名不同内容 409 `NAME_CONTENT_CONFLICT` |
+| GET | `/api/envelope/envelopes` / `.../{id}` | 信封列表/详情 |
+| GET | `/api/envelope/envelopes/{id}/proofs` | 构件、分块、签名全部 Merkle 包含证明 |
+| GET | `/api/envelope/envelopes/{id}/verify` | 在线验真内容、注册表、签名、Merkle root |
+| GET | `/api/envelope/envelopes/{id}/bundle` | 下载可离线验真 ZIP |
+| POST | `/api/envelope/verify-offline` | `{bundle_hex, trusted_root_kid?}` 验证 ZIP 内容 |
+| GET | `/api/envelope/lineage?name=或envelope_id=` | 父信封链与发布名 |
+| GET | `/api/envelope/publications` / `/audit` | 发布列表与篡改/拒绝审计 |
+
+ZIP 内固定包含 `MANIFEST.json`、`SIGNATURES.json`、`TRUST.json`、`PROOFS.json`
+和 `artifacts/*`。离线验真会重算每个 artifact 与分块 SHA-256，校验注册表根签名、
+签名发生时密钥是否有效、签名角色/人是否匹配，以及最终 Merkle root；任一项失败返回
+`OFFLINE_VERIFICATION_FAILED.detail.reasons`。
+
 ## 典型时序（一次合规发布）
 
 ```
